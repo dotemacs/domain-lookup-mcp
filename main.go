@@ -1,10 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"sync"
 
 	mcp "github.com/metoro-io/mcp-golang"
@@ -26,40 +26,48 @@ func lookupDomain(client *rdap.Client, domain string) string {
 
 	resp, err := client.Do(req)
 
-	found := false
+	status := "available"
 	if err == nil && resp != nil {
 		if _, ok := resp.Object.(*rdap.Domain); ok {
-			found = true
+			status = "registered"
 		}
 	} else if err != nil {
 		log.Printf("RDAP lookup error for %s: %v", domain, err)
 	}
 
-	var resultMsg string
-	if found {
-		resultMsg = fmt.Sprintf("Domain '%s' appears to be registered.", domain)
-	} else {
-		resultMsg = fmt.Sprintf("Domain '%s' appears to be available or could not be confirmed.", domain)
-	}
-	return resultMsg
+	log.Printf("RDAP lookup result for %s: %s", domain, status)
+	return status
 }
 
 func lookupDomainMCP(client *rdap.Client, args SingleDomainLookup) (*mcp.ToolResponse, error) {
-	log.Printf("Received lookup request for domain: %s", args.Domain)
+	log.Printf("Received single lookup request for domain: %s", args.Domain)
 
-	resultMsg := lookupDomain(client, args.Domain)
+	status := lookupDomain(client, args.Domain)
 
-	log.Printf("Responding: %s", resultMsg)
+	resultMap := map[string]string{
+		args.Domain: status,
+	}
 
-	return mcp.NewToolResponse(mcp.NewTextContent(resultMsg)), nil
+	jsonBytes, err := json.Marshal(resultMap)
+	if err != nil {
+		log.Printf("Error marshalling single domain result to JSON: %v", err)
+
+		errorMsg := fmt.Sprintf("Error formatting result for %s", args.Domain)
+		return mcp.NewToolResponse(mcp.NewTextContent(errorMsg)), nil
+	}
+
+	jsonString := string(jsonBytes)
+	log.Printf("Responding with JSON string: %s", jsonString)
+
+	return mcp.NewToolResponse(mcp.NewTextContent(jsonString)), nil
 }
 
 func lookupDomainsMCP(client *rdap.Client, args MultipleDomainsLookup) (*mcp.ToolResponse, error) {
-	log.Printf("Received lookup request for %d domains: %v", len(args.Domains), args.Domains)
+	log.Printf("Received multiple lookup request for %d domains: %v", len(args.Domains), args.Domains)
 
 	numDomains := len(args.Domains)
 	if numDomains == 0 {
-		return mcp.NewToolResponse(mcp.NewTextContent("No domains provided for lookup.")), nil
+		return mcp.NewToolResponse(mcp.NewTextContent("{}")), nil
 	}
 
 	const numWorkers = 10
@@ -75,49 +83,42 @@ func lookupDomainsMCP(client *rdap.Client, args MultipleDomainsLookup) (*mcp.Too
 		workerWg.Add(1)
 		go func(workerID int) {
 			defer workerWg.Done()
-			log.Printf("Worker %d started.", workerID)
 			for domain := range tasks {
-				log.Printf("Worker %d processing domain: %s", workerID, domain)
-				resultMsg := lookupDomain(client, domain)
-				singleResult := map[string]string{domain: resultMsg}
+				status := lookupDomain(client, domain)
+				singleResult := map[string]string{domain: status}
 				resultsChan <- singleResult
 			}
-			log.Printf("Worker %d finished.", workerID)
 		}(i)
 	}
 
-	log.Println("Dispatching tasks to workers...")
 	for _, domain := range args.Domains {
 		tasks <- domain
 	}
 	close(tasks)
-	log.Println("All tasks dispatched. Waiting for workers...")
 
 	workerWg.Wait()
-	log.Println("All workers finished.")
 
 	close(resultsChan)
-	log.Println("Results channel closed.")
 
 	finalResults := make(map[string]string, numDomains)
-	log.Println("Collecting results...")
+
 	for result := range resultsChan {
-		for domain, msg := range result {
-			finalResults[domain] = msg
+		for domain, status := range result {
+			finalResults[domain] = status
 		}
 	}
-	log.Printf("Collected %d results.", len(finalResults))
 
-	var responseBuilder strings.Builder
-	responseBuilder.WriteString("Domain lookup results:\n")
-	for _, domain := range args.Domains {
-		responseBuilder.WriteString(fmt.Sprintf("- %s\n", finalResults[domain]))
+	jsonBytes, err := json.Marshal(finalResults)
+	if err != nil {
+		log.Printf("Error marshalling multiple domain results to JSON: %v", err)
+		errorMsg := "Error formatting results for multiple domains"
+		return mcp.NewToolResponse(mcp.NewTextContent(errorMsg)), nil // Or return the error?
 	}
 
-	finalResponse := responseBuilder.String()
-	log.Printf("Responding with combined results:\n%s", finalResponse)
+	jsonString := string(jsonBytes)
+	log.Printf("Responding with JSON string: %s", jsonString)
 
-	return mcp.NewToolResponse(mcp.NewTextContent(finalResponse)), nil
+	return mcp.NewToolResponse(mcp.NewTextContent(jsonString)), nil
 }
 
 func minWorkers(a, b int) int {
@@ -137,7 +138,7 @@ func main() {
 
 	err := server.RegisterTool(
 		"lookup_domain",
-		"Looks up a single domain name using RDAP to check if it is registered.",
+		"Looks up a single domain name using RDAP. Returns JSON: {\"domain\": \"status\"} ('registered' or 'available').",
 		func(args SingleDomainLookup) (*mcp.ToolResponse, error) {
 			return lookupDomainMCP(rdapClient, args)
 		},
@@ -150,7 +151,7 @@ func main() {
 
 	err = server.RegisterTool(
 		"lookup_domains",
-		"Looks up multiple domain names using RDAP to check if they are registered.",
+		"Looks up multiple domain names using RDAP. Returns JSON: {\"domain1\": \"status1\", ...} ('registered' or 'available').",
 		func(args MultipleDomainsLookup) (*mcp.ToolResponse, error) {
 			return lookupDomainsMCP(rdapClient, args)
 		},
