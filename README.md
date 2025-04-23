@@ -7,4 +7,16 @@ retired).
 
 - Checkout the repo
 - build it: `go build ./...`
-- Point your MCP client at the binary
+- Point your MCP client at the binary:
+
+```javascript
+{
+  "mcpServers": {
+    "rdap-mcp": {
+      "command": "/path/to/rdap-mcp/rdap-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
