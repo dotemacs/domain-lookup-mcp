@@ -12,6 +12,11 @@ import (
 	"github.com/openrdap/rdap"
 )
 
+// RDAPClient defines the interface for RDAP clients
+type RDAPClient interface {
+	Do(req *rdap.Request) (*rdap.Response, error)
+}
+
 type SingleDomainLookup struct {
 	Domain string `json:"domain" jsonschema:"required,description=The domain name to look up (e.g., google.com)"`
 }
@@ -20,7 +25,7 @@ type MultipleDomainsLookup struct {
 	Domains []string `json:"domains" jsonschema:"required,description=A list of domain names to look up (e.g., [\"google.com\", \"example.com\"])"`
 }
 
-func lookupDomain(client *rdap.Client, domain string) string {
+func lookupDomain(client RDAPClient, domain string) string {
 	log.Printf("Performing RDAP lookup for: %s", domain)
 	req := rdap.NewRequest(rdap.DomainRequest, domain)
 
@@ -28,7 +33,7 @@ func lookupDomain(client *rdap.Client, domain string) string {
 
 	status := "available"
 	if err == nil && resp != nil {
-		if _, ok := resp.Object.(*rdap.Domain); ok {
+		if _, ok := (*resp).Object.(*rdap.Domain); ok {
 			status = "registered"
 		}
 	} else if err != nil {
@@ -39,7 +44,7 @@ func lookupDomain(client *rdap.Client, domain string) string {
 	return status
 }
 
-func lookupDomainMCP(client *rdap.Client, args SingleDomainLookup) (*mcp.ToolResponse, error) {
+func lookupDomainMCP(client RDAPClient, args SingleDomainLookup) (*mcp.ToolResponse, error) {
 	log.Printf("Received single lookup request for domain: %s", args.Domain)
 
 	status := lookupDomain(client, args.Domain)
@@ -62,7 +67,7 @@ func lookupDomainMCP(client *rdap.Client, args SingleDomainLookup) (*mcp.ToolRes
 	return mcp.NewToolResponse(mcp.NewTextContent(jsonString)), nil
 }
 
-func lookupDomainsMCP(client *rdap.Client, args MultipleDomainsLookup) (*mcp.ToolResponse, error) {
+func lookupDomainsMCP(client RDAPClient, args MultipleDomainsLookup) (*mcp.ToolResponse, error) {
 	log.Printf("Received multiple lookup request for %d domains: %v", len(args.Domains), args.Domains)
 
 	numDomains := len(args.Domains)
@@ -112,7 +117,7 @@ func lookupDomainsMCP(client *rdap.Client, args MultipleDomainsLookup) (*mcp.Too
 	if err != nil {
 		log.Printf("Error marshalling multiple domain results to JSON: %v", err)
 		errorMsg := "Error formatting results for multiple domains"
-		return mcp.NewToolResponse(mcp.NewTextContent(errorMsg)), nil // Or return the error?
+		return mcp.NewToolResponse(mcp.NewTextContent(errorMsg)), nil
 	}
 
 	jsonString := string(jsonBytes)
