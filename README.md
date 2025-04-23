@@ -1,7 +1,6 @@
-# `rdap-mcp`
+# `domain-lookup-mcp`
 
-MCP server to look up domain names via RDAP (since whois(1) is now
-retired).
+MCP server to look up domain names via rdap(1) and then whois(1).
 
 ## How to use it?
 
@@ -12,8 +11,8 @@ retired).
 ```javascript
 {
   "mcpServers": {
-    "rdap-mcp": {
-      "command": "/path/to/rdap-mcp/rdap-mcp",
+    "domain-lookup-mcp": {
+      "command": "/path/to/domain-lookup-mcp/domain-lookup-mcp",
       "args": [],
       "env": {}
     }

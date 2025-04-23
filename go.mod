@@ -1,4 +1,4 @@
-module rdap-mcp
+module domain-lookup-mcp
 
 go 1.24.0
 
