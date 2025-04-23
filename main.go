@@ -1,53 +1,131 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	mcp "github.com/metoro-io/mcp-golang"
 	mcp_stdio "github.com/metoro-io/mcp-golang/transport/stdio"
 	"github.com/openrdap/rdap"
+	"github.com/shlin168/go-whois/whois"
 )
 
-// RDAPClient defines the interface for RDAP clients
+const (
+	StatusRegistered = "registered"
+	StatusAvailable  = "available"
+	StatusUnknown    = "unknown"
+)
+
 type RDAPClient interface {
 	Do(req *rdap.Request) (*rdap.Response, error)
 }
 
+type WhoisResult struct {
+	IsAvailable *bool
+	RawText     string
+}
+
+type WhoisProvider interface {
+	Query(ctx context.Context, domain string) (*WhoisResult, error)
+}
+
+type WhoisClient struct {
+	client *whois.Client
+}
+
+func NewWhoisClient() (WhoisProvider, error) {
+	c, err := whois.NewClient()
+	if err != nil {
+		return nil, fmt.Errorf("error creating real WHOIS client: %w", err)
+	}
+	return &WhoisClient{client: c}, nil
+}
+
+func (g *WhoisClient) Query(ctx context.Context, domain string) (*WhoisResult, error) {
+	result, err := g.client.Query(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+
+	return &WhoisResult{
+		IsAvailable: result.IsAvailable,
+		RawText:     result.RawText,
+	}, nil
+}
+
 type SingleDomainLookup struct {
-	Domain string `json:"domain" jsonschema:"required,description=The domain name to look up (e.g., google.com)"`
+	Domain string `json:"domain" jsonschema:"required,description=The domain name to look up (e.g., foo.bar)"`
 }
 
 type MultipleDomainsLookup struct {
-	Domains []string `json:"domains" jsonschema:"required,description=A list of domain names to look up (e.g., [\"google.com\", \"example.com\"])"`
+	Domains []string `json:"domains" jsonschema:"required,description=A list of domain names to look up (e.g., [\"foo.bar\", \"example.com\"])"`
 }
 
-func lookupDomain(client RDAPClient, domain string) string {
-	log.Printf("Performing RDAP lookup for: %s", domain)
-	req := rdap.NewRequest(rdap.DomainRequest, domain)
+func lookupWithWhois(whoisClient WhoisProvider, domain string) string {
+	log.Printf("Performing WHOIS lookup for: %s", domain)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	resp, err := client.Do(req)
-
-	status := "available"
-	if err == nil && resp != nil {
-		if _, ok := (*resp).Object.(*rdap.Domain); ok {
-			status = "registered"
-		}
-	} else if err != nil {
-		log.Printf("RDAP lookup error for %s: %v", domain, err)
+	whoisResult, err := whoisClient.Query(ctx, domain)
+	if err != nil {
+		log.Printf("WHOIS lookup error for %s: %v", domain, err)
+		return StatusUnknown
 	}
 
-	log.Printf("RDAP lookup result for %s: %s", domain, status)
+	status := StatusUnknown
+	if whoisResult.IsAvailable != nil {
+		if *whoisResult.IsAvailable {
+			status = StatusAvailable
+		} else {
+			status = StatusRegistered
+		}
+	} else if whoisResult.RawText != "" {
+		log.Printf("WHOIS raw text found for %s but availability unclear, inferring as registered", domain)
+		status = StatusRegistered
+	}
+
+	log.Printf("WHOIS lookup result for %s: %s", domain, status)
 	return status
 }
 
-func lookupDomainMCP(client RDAPClient, args SingleDomainLookup) (*mcp.ToolResponse, error) {
+func lookupDomain(rdapClient RDAPClient, whoisClient WhoisProvider, domain string) string {
+	log.Printf("Performing RDAP lookup for: %s", domain)
+	req := rdap.NewRequest(rdap.DomainRequest, domain)
+
+	resp, err := rdapClient.Do(req)
+
+	status := StatusUnknown
+
+	if err != nil {
+		log.Printf("RDAP lookup error for %s: %v", domain, err)
+	} else if resp != nil {
+		if _, ok := (*resp).Object.(*rdap.Domain); ok {
+			status = StatusRegistered
+		} else {
+			log.Printf("RDAP lookup for %s succeeded but response object was not *rdap.Domain", domain)
+		}
+	}
+
+	log.Printf("RDAP lookup intermediate result for %s: %s", domain, status)
+
+	if status == StatusUnknown {
+		log.Printf("RDAP status for %s is unknown, attempting WHOIS fallback lookup.", domain)
+		status = lookupWithWhois(whoisClient, domain)
+	}
+
+	log.Printf("Final lookup result for %s: %s", domain, status)
+	return status
+}
+
+func lookupDomainMCP(rdapClient RDAPClient, whoisClient WhoisProvider, args SingleDomainLookup) (*mcp.ToolResponse, error) {
 	log.Printf("Received single lookup request for domain: %s", args.Domain)
 
-	status := lookupDomain(client, args.Domain)
+	status := lookupDomain(rdapClient, whoisClient, args.Domain)
 
 	resultMap := map[string]string{
 		args.Domain: status,
@@ -56,7 +134,6 @@ func lookupDomainMCP(client RDAPClient, args SingleDomainLookup) (*mcp.ToolRespo
 	jsonBytes, err := json.Marshal(resultMap)
 	if err != nil {
 		log.Printf("Error marshalling single domain result to JSON: %v", err)
-
 		errorMsg := fmt.Sprintf("Error formatting result for %s", args.Domain)
 		return mcp.NewToolResponse(mcp.NewTextContent(errorMsg)), nil
 	}
@@ -67,7 +144,7 @@ func lookupDomainMCP(client RDAPClient, args SingleDomainLookup) (*mcp.ToolRespo
 	return mcp.NewToolResponse(mcp.NewTextContent(jsonString)), nil
 }
 
-func lookupDomainsMCP(client RDAPClient, args MultipleDomainsLookup) (*mcp.ToolResponse, error) {
+func lookupDomainsMCP(rdapClient RDAPClient, whoisClient WhoisProvider, args MultipleDomainsLookup) (*mcp.ToolResponse, error) {
 	log.Printf("Received multiple lookup request for %d domains: %v", len(args.Domains), args.Domains)
 
 	numDomains := len(args.Domains)
@@ -89,7 +166,7 @@ func lookupDomainsMCP(client RDAPClient, args MultipleDomainsLookup) (*mcp.ToolR
 		go func(workerID int) {
 			defer workerWg.Done()
 			for domain := range tasks {
-				status := lookupDomain(client, domain)
+				status := lookupDomain(rdapClient, whoisClient, domain)
 				singleResult := map[string]string{domain: status}
 				resultsChan <- singleResult
 			}
@@ -102,11 +179,9 @@ func lookupDomainsMCP(client RDAPClient, args MultipleDomainsLookup) (*mcp.ToolR
 	close(tasks)
 
 	workerWg.Wait()
-
 	close(resultsChan)
 
 	finalResults := make(map[string]string, numDomains)
-
 	for result := range resultsChan {
 		for domain, status := range result {
 			finalResults[domain] = status
@@ -139,13 +214,20 @@ func main() {
 	rdapClient := &rdap.Client{}
 	log.Println("Shared RDAP client created.")
 
+	whoisClient, err := NewWhoisClient()
+	if err != nil {
+		log.Fatalf("Error creating WHOIS client: %v", err)
+		os.Exit(1)
+	}
+	log.Println("Shared WHOIS client created.")
+
 	server := mcp.NewServer(mcp_stdio.NewStdioServerTransport())
 
-	err := server.RegisterTool(
+	err = server.RegisterTool(
 		"lookup_domain",
-		"Looks up a single domain name using RDAP. Returns JSON: {\"domain\": \"status\"} ('registered' or 'available').",
+		`Looks up a single domain name using RDAP (with WHOIS fallback). Returns JSON: {"domain": "status"} ('registered', 'available', or 'unknown')`,
 		func(args SingleDomainLookup) (*mcp.ToolResponse, error) {
-			return lookupDomainMCP(rdapClient, args)
+			return lookupDomainMCP(rdapClient, whoisClient, args)
 		},
 	)
 	if err != nil {
@@ -156,16 +238,15 @@ func main() {
 
 	err = server.RegisterTool(
 		"lookup_domains",
-		"Looks up multiple domain names using RDAP. Returns JSON: {\"domain1\": \"status1\", ...} ('registered' or 'available').",
+		`Looks up multiple domain names using RDAP (with WHOIS fallback). Returns JSON: {"domain1": "status1", ...} ('registered', 'available', or 'unknown')`,
 		func(args MultipleDomainsLookup) (*mcp.ToolResponse, error) {
-			return lookupDomainsMCP(rdapClient, args)
+			return lookupDomainsMCP(rdapClient, whoisClient, args)
 		},
 	)
 	if err != nil {
 		log.Fatalf("Error registering lookup_domains tool: %v", err)
 		os.Exit(1)
 	}
-
 	log.Println("lookup_domains tool registered. MCP Server waiting for requests...")
 
 	err = server.Serve()
@@ -173,5 +254,5 @@ func main() {
 		log.Fatalf("MCP Server error: %v", err)
 	}
 
-	select {}
+	select {} // Keep server running
 }
